@@ -486,14 +486,28 @@ get_query_response(LogFun, RecvPid, Version, Options) ->
 	{ok, <<Fieldcount:8, Rest/binary>>, _} ->
 	    case Fieldcount of
 		0 ->
-		    %% No Tabular data
-		    AffectedRows = case Rest of
-			<<16#fc, Value:16/little, _/binary>> -> Value;
-			<<16#fd, Value:24/little, _/binary>> -> Value;
-			<<16#fe, Value:64/little, _/binary>> -> Value;
-			<<Value:8, _/binary>> -> Value
+		    %% No Tabular data, see https://dev.mysql.com/doc/internals/en/packet-OK_Packet.html
+		    {AffectedRows, Rest1} = case Rest of
+			<<16#fc, Value:16/little, R/binary>> -> {Value, R};
+			<<16#fd, Value:24/little, R/binary>> -> {Value, R};
+			<<16#fe, Value:64/little, R/binary>> -> {Value, R};
+			<<Value:8, R/binary>> -> {Value, R}
 		    end,
-		    {updated, #p1_mysql_result{affectedrows=AffectedRows}};
+		    case get_option(result_changed, Options, false) of
+			true ->
+			    % read last_insert_id
+			    Rest2 = case Rest1 of
+					<<16#fc, _:16/little, R1/binary>> -> R1;
+					<<16#fd, _:24/little, R1/binary>> -> R1;
+					<<16#fe, _:64/little, R1/binary>> -> R1;
+					<<_:8, R1/binary>> -> R1
+				    end,
+			    <<_StatusFlags:16, _Warnings:16, Rest3/binary>> = Rest2,
+			    {Status, _} = get_with_length(Rest3),
+			    {updated, #p1_mysql_result{affectedrows=decode_changed(Status, AffectedRows)}};
+			_ ->
+			    {updated, #p1_mysql_result{affectedrows=AffectedRows}}
+		    end;
 		255 ->
 		    <<_Code:16/little, Message/binary>>  = Rest,
 		    {error, #p1_mysql_result{error=binary_to_list(Message)}};
@@ -779,3 +793,12 @@ get_option(Key, Options, Default) ->
 	false ->
 	    Default
     end.
+
+decode_changed(<<>>, Default) -> decode_changed(Default, Default);
+decode_changed(<<"Changed: ", Value/binary>>, Default) -> {Default, decode_changed_number(0, Value)};
+decode_changed(<<_:8, Rest/binary>>, Default) -> decode_changed(Rest, Default).
+
+decode_changed_number(Number, <<>>) -> Number;
+decode_changed_number(Number, <<" ", _/binary>>) -> Number;
+decode_changed_number(Number, <<Digit, R/binary>>) ->
+    decode_changed_number(Number * 10 + Digit - 48, R).
